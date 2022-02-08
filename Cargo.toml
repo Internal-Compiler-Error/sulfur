@@ -1,0 +1,21 @@
+[package]
+name = "sulfur"
+version = "0.1.0"
+edition = "2021"
+
+
+[dependencies]
+reqwest = { version = "0.11.9", features = ["stream"] }
+tokio = { version = "1.16.0", features = ["full", "tracing"] }
+hyper = { version = "0.14.16", features = ["full"] }
+tower = { version = "0.4.11", features = ["full"] }
+futures = "0.3.21"
+num_cpus = "1.13.1"
+console-subscriber = "0.1.2"
+url = { version = "2.2.2", features = ["serde"] }
+tracing-subscriber = "0.3.8"
+serde = "1.0.136"
+tracing = "0.1.30"
+axum = { version = "0.4.5", features = ["http2", "multipart", "tower-log"] }
+async-trait = "0.1.52"
+tower-http = { version = "0.2.1", features = ["full"] }
