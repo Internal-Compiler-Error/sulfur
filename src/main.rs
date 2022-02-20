@@ -16,11 +16,9 @@ use url::Url;
 
 #[tokio::main]
 async fn main() {
-    let collector = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
-        .finish();
-
-    tracing::subscriber::set_global_default(collector).expect("unable to install log handler");
+        .init();
 
     let app = Router::new()
         .route("/", get(root))
