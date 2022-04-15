@@ -32,7 +32,6 @@ struct HttpDownloader {
 }
 
 
-
 /// Given a size, split into [begin, end) intervals suitable for parallel downloads by the number of
 /// CPU cores
 pub fn split_range(size: usize) -> Vec<(usize, usize)> {
