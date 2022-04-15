@@ -1,21 +1,25 @@
-#![allow(dead_code, unused_imports)]
+#![allow(dead_code)]
+
 mod api;
 mod download;
+mod http;
 
-use axum::routing::Route;
-use axum::{http, routing::get, Json, Router};
+
+use axum::{routing::get, Router};
 
 use crate::api::v1;
-use async_trait::async_trait;
-use axum::extract::{FromRequest, Query, RequestParts};
-use serde::Deserialize;
+
+
+
 use std::net::SocketAddr;
-use tower_http::{classify::ServerErrorsFailureClass, trace::TraceLayer};
-use tracing::{info, Level};
-use url::Url;
+use tower_http::{trace::TraceLayer};
+use tracing::{Level};
+
 
 #[tokio::main]
-async fn main() {
+async fn main() -> color_eyre::Result<()> {
+    color_eyre::install()?;
+
     tracing_subscriber::fmt()
         .with_max_level(Level::TRACE)
         .init();
@@ -33,6 +37,8 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+
+    Ok(())
 }
 
 async fn root() -> &'static str {
