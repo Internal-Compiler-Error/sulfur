@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 
+mod schema;
 mod api;
-mod download;
 mod http;
+mod model;
 
 
 use axum::{routing::get, Router};
