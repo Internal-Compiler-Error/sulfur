@@ -1,9 +1,14 @@
 #![allow(dead_code)]
 
-mod schema;
-mod api;
-mod http;
-mod model;
+#[macro_use]
+extern crate diesel;
+
+
+pub mod schema;
+pub mod api;
+pub mod http;
+pub mod model;
+pub mod persistence;
 
 
 use axum::{routing::get, Router};

@@ -14,5 +14,5 @@ CREATE TABLE IF NOT EXISTS sub_http_download
     offset    INTEGER NOT NULL,
     uri       TEXT    NOT NULL,
     progress  REAL    NOT NULL,
-    FOREIGN KEY (parent_id) REFERENCES http_download (id)
+    FOREIGN KEY (parent_id) REFERENCES http_download (id) ON DELETE CASCADE
 );

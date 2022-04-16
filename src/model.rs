@@ -1,9 +1,9 @@
 use std::path::PathBuf;
 
-type DownloadId = u64;
-type SubDownloadId = u64;
+pub type DownloadId = u64;
+pub type SubDownloadId = u64;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Queryable)]
 pub struct Download {
     pub id: DownloadId,
     pub uri: hyper::Uri,
@@ -12,14 +12,14 @@ pub struct Download {
     // TODO: figure out if having a list of subdownloads here is a good idea
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Queryable)]
 pub struct SubDownload {
     pub id: SubDownloadId,
     pub parent_id: DownloadId,
 
     /// offset denotes where should the file be seeked to before writing new data
     pub offset: u32,
-    
+
     pub uri: hyper::Uri,
     pub progress: f64,
 }
