@@ -16,7 +16,6 @@ use axum::{routing::get, Router};
 use crate::api::v1;
 
 
-
 use std::net::SocketAddr;
 use tower_http::{trace::TraceLayer};
 use tracing::{Level};
@@ -34,7 +33,8 @@ async fn main() -> color_eyre::Result<()> {
         .route("/", get(root))
         .layer(TraceLayer::new_for_http())
         .route("/api/v1/hello-world", get(hello_world))
-        .route("/api/v1/download", get(v1::new_download));
+        // .route("/api/v1/download", get(v1::new_download));
+        ;
 
     let addr = SocketAddr::from(([127, 0, 0, 1], 6969));
 

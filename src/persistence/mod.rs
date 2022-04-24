@@ -1,17 +1,26 @@
+use std::error::Error;
 use crate::model::{Download, DownloadId, SubDownloadId, SubDownload};
+use crate::schema::sub_http_download::parent_id;
 
 pub mod in_memory;
+pub mod sqlite;
 
-pub trait DownloadStore {
-    // todo: consider using a static result type
-    fn download_by_id(&self, id: DownloadId) -> color_eyre::Result<Option<Download>>;
-    fn download_by_uri(&self, uri: hyper::Uri) -> color_eyre::Result<Option<Vec<Download>>>;
-    fn store_download(&self, download: &Download) -> color_eyre::Result<()>;
+
+pub trait DownloadStore<E>
+    where E: Error
+{
+    fn download_by_id(&self, id: DownloadId) -> Result<Option<Download>, E>;
+    fn download_by_uri(&self, uri: hyper::Uri) -> Result<Option<Vec<Download>>, E>;
+    fn store_download(&mut self, download: &Download) -> Result<(), E>;
+    fn remove_download(&mut self, id: DownloadId) -> Result<(), E>;
 }
 
-pub trait SubDownloadStore {
-    fn sub_download_by_parent(&self, parent: DownloadId) -> color_eyre::Result<Option<Vec<SubDownload>>>;
-    fn sub_download_by_id(&self, id: SubDownloadId) -> color_eyre::Result<Option<SubDownload>>;
-    fn sub_download_by_uri(&self, uri: hyper::Uri) -> color_eyre::Result<Option<Vec<SubDownload>>>;
-    fn store_sub_download(&self, sub_download: &SubDownload) -> color_eyre::Result<()>;
+pub trait SubDownloadStore<E>
+    where E: Error
+{
+    fn sub_download_by_parent(&self, parent: DownloadId) -> Result<Option<Vec<SubDownload>>, E>;
+    fn sub_download_by_id(&self, id: SubDownloadId) -> Result<Option<SubDownload>, E>;
+    fn sub_download_by_uri(&self, uri: hyper::Uri) -> Result<Option<Vec<SubDownload>>, E>;
+    fn store_sub_download(&mut self, sub_download: &SubDownload, download_id: DownloadId) -> Result<(), E>;
+    fn remove_sub_download(&mut self, id: SubDownloadId) -> Result<(), E>;
 }

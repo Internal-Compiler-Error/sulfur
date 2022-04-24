@@ -2,7 +2,7 @@ table! {
     http_download (id) {
         id -> Integer,
         uri -> Text,
-        progress -> Float,
+        progress -> Double,
         path -> Text,
     }
 }
@@ -13,7 +13,7 @@ table! {
         parent_id -> Integer,
         offset -> Integer,
         uri -> Text,
-        progress -> Float,
+        progress -> Double,
     }
 }
 

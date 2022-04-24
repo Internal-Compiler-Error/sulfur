@@ -1,6 +1,5 @@
 use std::fmt::{Debug, Display, Formatter};
 use std::path::PathBuf;
-use axum::handler::Handler;
 use color_eyre::Report;
 use hyper::{Body, client::Client, http::uri::Scheme, Request};
 use hyper::client::connect::Connect;
