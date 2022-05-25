@@ -1,19 +1,21 @@
 #![allow(dead_code)]
-
 #[macro_use]
 extern crate diesel;
 
+#[cfg(test)]
+#[macro_use]
+extern crate diesel_migrations;
 
-pub mod schema;
-pub mod api;
-pub mod http;
-pub mod model;
-pub mod persistence;
+
+mod schema;
+mod api;
+mod http;
+mod request;
+mod util;
 
 
 use axum::{routing::get, Router};
 
-use crate::api::v1;
 
 
 use std::net::SocketAddr;

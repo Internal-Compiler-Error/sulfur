@@ -14,13 +14,13 @@ use url::{Url};
 
 
 
-/// Maps to /api/v1/download
+#[allow(unused)]/// Maps to /api/v1/download
 pub async fn new_download(req: Query<DownloadReq>) -> color_eyre::Result<String> {
     // let client = Client::new();
-    // let url = req.0.url;
+    // let Url = req.0.Url;
     //
-    // let url_clone = url.clone();
-    // let request = client.get(url).build()?;
+    // let url_clone = Url.clone();
+    // let request = client.get(Url).build()?;
     //
     // client.execute(request).await?;
     //

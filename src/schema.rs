@@ -1,25 +1,30 @@
 table! {
-    http_download (id) {
-        id -> Integer,
-        uri -> Text,
-        progress -> Double,
+    file_path (path) {
         path -> Text,
     }
 }
 
 table! {
-    sub_http_download (id) {
+    http_subdownload (id) {
         id -> Integer,
-        parent_id -> Integer,
+        url -> Text,
         offset -> Integer,
-        uri -> Text,
-        progress -> Double,
+        total -> Integer,
+        file_path -> Text,
     }
 }
 
-joinable!(sub_http_download -> http_download (parent_id));
+table! {
+    url (full_text) {
+        full_text -> Text,
+    }
+}
+
+joinable!(http_subdownload -> file_path (file_path));
+joinable!(http_subdownload -> url (url));
 
 allow_tables_to_appear_in_same_query!(
-    http_download,
-    sub_http_download,
+    file_path,
+    http_subdownload,
+    url,
 );
