@@ -12,17 +12,17 @@ futures = "0.3.21"
 num_cpus = "1.13.1"
 console-subscriber = "0.1.2"
 url = { version = "2.2.2", features = ["serde"] }
-tracing-subscriber = "0.3.8"
+tracing-subscriber = "^0.3"
 serde = "^1.0"
 tracing = "^0.1"
 axum = { version = "^0.5", features = ["http2", "multipart", "tower-log"] }
 async-trait = "^0.1"
-tower-http = { version = "^0.2", features = ["full"] }
+tower-http = { version = "^0.3", features = ["full"] }
 diesel = { version = "^1.4", features = ["sqlite", "r2d2"] }
 hyper-rustls = { version = "^0.23", features = ["default", "http2"] }
 color-eyre = "0.6.1"
 multimap = "0.8.3"
 pretty_assertions = "1.2.1"
-derive_more = "0.99.17"
+derive_more = "^0.99"
 diesel_migrations = { version = "^1.4", features = ["sqlite"] }
 same-types = "0.1.1"

@@ -1,39 +1,48 @@
-use std::{error::{Error},
-          fmt::{Display, Formatter, Debug},
-          path::{Path, PathBuf},
-          sync::{Arc},
-          num::{ParseIntError},
-          future::Future,
-          ops::DerefMut,
+use crate::{
+    request::http::{HttpRequest, HttpRequestSource},
+    schema::*,
+    util::{last_insert_rowid, EnableForeignKeys},
 };
-use derive_more::{Display, Error};
-use diesel::{ExpressionMethods,
-             QueryDsl,
-             r2d2, r2d2::{ConnectionManager, Pool},
-             RunQueryDsl,
-             SqliteConnection};
-use tokio::{task::{JoinHandle},
-            io::{AsyncWriteExt, AsyncSeekExt, SeekFrom},
-            sync::Mutex,
-            fs::OpenOptions,
-            select};
-use hyper_rustls::HttpsConnectorBuilder;
-use futures::future::join_all;
 use ::url::Url as WgUrl;
-use hyper::{Body,
-            Client,
-            Request,
-            client::{connect::Connect, HttpConnector},
-            body::HttpBody};
-use crate::{schema::*, request::http::{HttpRequestSource, HttpRequest}, util::{last_insert_rowid, EnableForeignKeys}};
+use derive_more::{Display, Error};
+use diesel::{
+    r2d2,
+    r2d2::{ConnectionManager, Pool},
+    ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection,
+};
+use futures::future::join_all;
+use hyper::{
+    body::HttpBody,
+    client::{connect::Connect, HttpConnector},
+    Body, Client, Request, Version,
+};
+use hyper_rustls::HttpsConnectorBuilder;
+use serde::ser::StdError;
+use std::{
+    error::Error,
+    fmt::{Debug, Display, Formatter},
+    future::Future,
+    num::ParseIntError,
+    ops::DerefMut,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncSeekExt, AsyncWriteExt, SeekFrom},
+    sync::{oneshot::Receiver, Mutex},
+    task::JoinHandle,
+};
+use tracing::{event, Level};
 
 #[derive(Debug, Display, Error)]
 enum ParseError {
-    UnsupportedSchema
+    UnsupportedSchema,
 }
 
+/// A `DownloadContext` allow us to record all the states required to persist and restart a download.
 #[derive(Debug)]
-pub struct SubDownload {
+pub struct DownloadContext {
     // having an id here directly is not great, but without it, we don't know which row to update
     // multiple subdownloads will share the same file path and url; offset and total will be changed
     // by then so we can't do a look up with them. Having an id is the easiest way to solve this
@@ -44,7 +53,6 @@ pub struct SubDownload {
     pub total: usize,
     pub file_path: Arc<Path>,
 }
-
 
 #[derive(Debug, Queryable, Insertable, Identifiable, Associations)]
 #[table_name = "file_path"]
@@ -60,8 +68,12 @@ struct PathConversionError {
 }
 
 impl Display for PathConversionError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let path_err = if self.invalid_path { "Invalid path" } else { " " };
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let path_err = if self.invalid_path {
+            "Invalid path"
+        } else {
+            " "
+        };
         let file_err = if self.not_file { "Not a file" } else { " " };
         let err_msg = [path_err, file_err].join(" and ");
         write!(f, "{}", err_msg.trim())
@@ -98,7 +110,6 @@ impl From<&PathBuf> for PathTable {
     }
 }
 
-
 #[derive(Debug, Queryable, Insertable, Identifiable, Associations)]
 #[table_name = "url"]
 #[primary_key(full_text)]
@@ -133,21 +144,22 @@ struct SubDownloadTable {
     pub file_path: String,
 }
 
-
 #[derive(Debug, Display, Error)]
 enum StoreError {
     NotFound,
 }
 
 pub trait DownloadStore: Debug {
-    fn add_download(&self, download: &SubDownload) -> Result<i32, diesel::result::Error>;
+    fn add_download(&self, download: &DownloadContext) -> Result<i32, diesel::result::Error>;
     // todo: perhaps it should take an id?
-    fn update_download(&self, download: &SubDownload) -> Result<(), diesel::result::Error>;
-    fn downloads_by_url(&self, wg_url: &WgUrl) -> Result<Vec<SubDownload>, diesel::result::Error>;
+    fn update_download(&self, download: &DownloadContext) -> Result<(), diesel::result::Error>;
+    fn downloads_by_url(
+        &self,
+        wg_url: &WgUrl,
+    ) -> Result<Vec<DownloadContext>, diesel::result::Error>;
     fn remove_by_url(&self, wg_url: &WgUrl) -> Result<(), diesel::result::Error>;
     fn remove_by_id(&self, id: i32) -> Result<(), diesel::result::Error>;
 }
-
 
 pub type SharedDownloadStore = Arc<dyn DownloadStore + Send + Sync>;
 
@@ -158,7 +170,7 @@ struct SqliteStore {
 #[allow(unused_variables)]
 impl Debug for SqliteStore {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        todo!("maybe just print the entire state of the database?")
+        write!(f, "FIXED FFS")
     }
 }
 
@@ -170,14 +182,12 @@ impl SqliteStore {
             .connection_customizer(Box::new(EnableForeignKeys::new()))
             .build(manager)?;
 
-        Ok(Self {
-            pool,
-        })
+        Ok(Self { pool })
     }
 }
 
 impl DownloadStore for SqliteStore {
-    fn add_download(&self, download: &SubDownload) -> Result<i32, diesel::result::Error> {
+    fn add_download(&self, download: &DownloadContext) -> Result<i32, diesel::result::Error> {
         // find if the url already exists
         let conn = self.pool.get().expect("Failed to get connection");
 
@@ -186,25 +196,33 @@ impl DownloadStore for SqliteStore {
 
         // find if the file path already exists
         use crate::schema::file_path::dsl::*;
-        let file_path_query = file_path.filter(path.eq((*download.file_path).as_os_str().to_string_lossy())).limit(1);
-
+        let file_path_query = file_path
+            .filter(path.eq((*download.file_path).as_os_str().to_string_lossy()))
+            .limit(1);
 
         conn.exclusive_transaction(|| {
             let url_res = url_query.first::<UrlTable>(&conn);
             let file_path_res = file_path_query.first::<PathTable>(&conn);
-
 
             match (url_res, file_path_res) {
                 // they both exist, then we can just add the download
                 (Ok(_), Ok(_)) => {}
                 // both of them don't exist, we need to crate them first to fulfill the relationship
                 (Err(diesel::result::Error::NotFound), Err(diesel::result::Error::NotFound)) => {
-                    let url_table = UrlTable { full_text: download.url.to_string() };
-                    let file_path_table = PathTable { path: (*download.file_path).to_string_lossy().to_string() };
+                    let url_table = UrlTable {
+                        full_text: download.url.to_string(),
+                    };
+                    let file_path_table = PathTable {
+                        path: (*download.file_path).to_string_lossy().to_string(),
+                    };
 
                     // I don't know why all the sudden I need to use the full path here, and I hate it
-                    diesel::insert_into(crate::schema::url::dsl::url).values(url_table).execute(&conn)?;
-                    diesel::insert_into(crate::schema::file_path::dsl::file_path).values(file_path_table).execute(&conn)?;
+                    diesel::insert_into(crate::schema::url::dsl::url)
+                        .values(url_table)
+                        .execute(&conn)?;
+                    diesel::insert_into(crate::schema::file_path::dsl::file_path)
+                        .values(file_path_table)
+                        .execute(&conn)?;
                 }
 
                 // if somehow only one of them exist, then the program is already broken
@@ -215,12 +233,15 @@ impl DownloadStore for SqliteStore {
             };
 
             use crate::schema::http_subdownload::dsl::*;
-            let insert = diesel::insert_into(http_subdownload)
-                .values((url.eq(download.url.as_str()),
-                         offset.eq(download.offset as i32),
-                         total.eq(download.total as i32),
-                         file_path.eq(download.file_path.to_str().expect("file path is not utf8????"))));
-
+            let insert = diesel::insert_into(http_subdownload).values((
+                url.eq(download.url.as_str()),
+                offset.eq(download.offset as i32),
+                total.eq(download.total as i32),
+                file_path.eq(download
+                    .file_path
+                    .to_str()
+                    .expect("file path is not utf8????")),
+            ));
 
             insert.execute(&conn)?;
 
@@ -230,60 +251,68 @@ impl DownloadStore for SqliteStore {
         })
     }
 
-    fn update_download(&self, download: &SubDownload) -> Result<(), diesel::result::Error> {
+    fn update_download(&self, download: &DownloadContext) -> Result<(), diesel::result::Error> {
         let conn = self.pool.get().expect("Failed to get connection");
 
         // construct the table equivalent of download (the subdownload struct itself cannot be
         // directly used with diesel, and update it
-
 
         let sql_form = SubDownloadTable {
             id: download.id,
             url: download.url.to_string(),
             offset: download.offset as i32,
             total: download.total as i32,
-            file_path: download.file_path.to_str().expect("file path is not utf8????").to_string(),
+            file_path: download
+                .file_path
+                .to_str()
+                .expect("file path is not utf8????")
+                .to_string(),
         };
-
 
         conn.exclusive_transaction(|| {
             use crate::schema::http_subdownload::dsl::*;
-            diesel::update(http_subdownload).set(&sql_form).execute(&conn)?;
+            diesel::update(http_subdownload)
+                .set(&sql_form)
+                .execute(&conn)?;
 
             Ok(())
         })
     }
 
-    fn downloads_by_url(&self, wg_url: &WgUrl) -> Result<Vec<SubDownload>, diesel::result::Error> {
+    fn downloads_by_url(
+        &self,
+        wg_url: &WgUrl,
+    ) -> Result<Vec<DownloadContext>, diesel::result::Error> {
         let conn = self.pool.get().expect("Failed to get connection");
 
         conn.exclusive_transaction(|| {
             use crate::schema::http_subdownload::dsl::*;
 
-            let result = http_subdownload.filter(url.eq(wg_url.as_str())).load::<SubDownloadTable>(&conn)?;
+            let result = http_subdownload
+                .filter(url.eq(wg_url.as_str()))
+                .load::<SubDownloadTable>(&conn)?;
             // assume result is not empty, if it is, then it should be an error and already returned
 
-            let url_p = Arc::new(WgUrl::parse(&result.first().unwrap().url).expect("database corrupted, url should be valid"));
-
+            let url_p = Arc::new(
+                WgUrl::parse(&result.first().unwrap().url)
+                    .expect("database corrupted, url should be valid"),
+            );
 
             let mut path = PathBuf::new();
             path.push(&result.first().unwrap().file_path);
 
-
             let path = Arc::from(path);
 
-
-            Ok(
-                result.iter().map(|x| {
-                    SubDownload {
-                        id: x.id,
-                        url: Arc::clone(&url_p),
-                        offset: x.offset as usize,
-                        total: x.total as usize,
-                        file_path: Arc::clone(&path),
-                    }
-                }).collect::<Vec<_>>()
-            )
+            Ok(result
+                .iter()
+                .map(|x| DownloadContext {
+                    id: x.id,
+                    url: Arc::clone(&url_p),
+                    offset: x.offset as usize,
+                    total: x.total as usize,
+                    file_path: Arc::clone(&path),
+                })
+                .collect::<Vec<_>>())
         })
     }
 
@@ -316,29 +345,120 @@ impl DownloadStore for SqliteStore {
     }
 }
 
-
 /// Given a size, split into [begin, end) intervals suitable for parallel downloads by the number of
 /// CPU cores
 fn split_range(size: usize) -> Vec<(usize, usize)> {
-    let mut ranges = vec![];
     let cores = num_cpus::get();
     let each_size = size / cores;
     let remainder = size % cores;
 
     // each cores gets the total size / core
-    for i in 0..cores - 1 {
-        ranges.push((each_size * i, each_size * (i + 1)))
-    }
+
+    let mut ranges: Vec<_> = (0..cores)
+        .map(|x| (each_size * x, each_size * (x + 1)))
+        .collect();
 
     // except the last core, which need to handle the remainder
-    ranges.push((each_size * cores, each_size * cores + remainder));
+    ranges.last_mut().unwrap().1 += remainder;
 
     ranges
 }
 
+pub trait DownloadSink: AsyncSeekExt + AsyncWriteExt + Send + Unpin + Debug + 'static {}
+
+pub struct Download<S, C> {
+    sink: Arc<Mutex<S>>,
+    context: DownloadContext,
+    http_client: Client<C, Body>,
+    persistence: SharedDownloadStore,
+    stop_token: Receiver<()>,
+}
+
+impl<S, C> Download<S, C>
+where
+    S: DownloadSink,
+    C: Connect + Sync + Send + Clone + 'static,
+{
+    fn new(
+        sink: Arc<Mutex<S>>,
+        context: DownloadContext,
+        http_client: Client<C, Body>,
+        persistence: SharedDownloadStore,
+        stop_token: Receiver<()>,
+    ) -> Self {
+        Self {
+            sink,
+            context,
+            http_client,
+            persistence,
+            stop_token,
+        }
+    }
+
+    async fn try_download(
+        &mut self,
+        version: hyper::Version,
+    ) -> Result<&DownloadContext, Box<dyn Error>> {
+        let request = Request::builder()
+            .version(version)
+            .uri(self.context.url.as_str())
+            .header(
+                "Range",
+                format!(
+                    "bytes={}-{}",
+                    self.context.offset,
+                    self.context.offset + self.context.total - 1
+                ),
+            )
+            .body(Body::empty())
+            .unwrap();
+
+        let response;
+
+        tokio::select! {
+            _ = &mut self.stop_token => { return Ok(&self.context) },
+            Ok(res) = self.http_client.request(request) => { response =  res; }
+        }
+
+        if !response.status().is_success() {
+            todo!()
+        }
+
+        let mut body = response.into_body();
+
+        tokio::select! {
+            _ = &mut self.stop_token => { return Ok(&self.context) },
+            Some(chunk) = body.data() => {
+                let chunk = chunk?;
+
+                let mut guard = self.sink.lock().await;
+
+                let sink = guard.deref_mut();
+
+                // make sure to seek to the correct position
+                sink.seek(SeekFrom::Start(self.context.offset as u64)).await?;
+
+                // then we can write
+                sink.write_all(&chunk).await?;
+
+                // update the offset
+                self.context.offset += chunk.len();
+
+                // update the database so query knows the most recent truth
+                self.persistence.update_download(&self.context)?
+            }
+        }
+
+        self.persistence.remove_by_id(self.context.id)?;
+
+        Ok(&self.context)
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpDownloader<R>
-    where R: HttpRequestSource + Send + Sync
+where
+    R: HttpRequestSource + Send + Sync,
 {
     request_source: Mutex<R>,
     download_store: SharedDownloadStore,
@@ -353,56 +473,57 @@ pub enum HttpDownloaderError {
     Other(String),
 }
 
-
 impl Display for HttpDownloaderError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match &self {
-            HttpDownloaderError::ContentLengthNotSupported => { write!(f, "Content-Length header not supported") }
-            HttpDownloaderError::BadServer => { write!(f, "The server returned something we can't continue with") }
-            HttpDownloaderError::Other(reason) => { write!(f, "generic error: {}", reason) }
+            HttpDownloaderError::ContentLengthNotSupported => {
+                write!(f, "Content-Length header not supported")
+            }
+            HttpDownloaderError::BadServer => {
+                write!(f, "The server returned something we can't continue with")
+            }
+            HttpDownloaderError::Other(reason) => {
+                write!(f, "generic error: {}", reason)
+            }
         }
     }
 }
 
 impl Error for HttpDownloaderError {}
 
-impl From<hyper::Error> for HttpDownloaderError
-{
+impl From<hyper::Error> for HttpDownloaderError {
     fn from(e: hyper::Error) -> Self {
         HttpDownloaderError::Other(format!("{}", e))
     }
 }
 
-impl From<hyper::header::ToStrError> for HttpDownloaderError
-{
+impl From<hyper::header::ToStrError> for HttpDownloaderError {
     fn from(e: hyper::header::ToStrError) -> Self {
         HttpDownloaderError::Other(format!("{}", e))
     }
 }
 
-impl From<ParseIntError> for HttpDownloaderError
-{
+impl From<ParseIntError> for HttpDownloaderError {
     fn from(e: ParseIntError) -> Self {
         HttpDownloaderError::Other(format!("{}", e))
     }
 }
 
-impl From<std::io::Error> for HttpDownloaderError
-{
+impl From<std::io::Error> for HttpDownloaderError {
     fn from(e: std::io::Error) -> Self {
         HttpDownloaderError::Other(format!("{}", e))
     }
 }
 
-impl From<diesel::result::Error> for HttpDownloaderError
-{
+impl From<diesel::result::Error> for HttpDownloaderError {
     fn from(e: diesel::result::Error) -> Self {
         HttpDownloaderError::Other(format!("{}", e))
     }
 }
 
 impl<R> HttpDownloader<R>
-    where R: HttpRequestSource + Send + Sync + 'static
+where
+    R: HttpRequestSource + Send + Sync + 'static,
 {
     fn new(request_source: R, shared_store: SharedDownloadStore) -> Self {
         HttpDownloader {
@@ -422,7 +543,7 @@ impl<R> HttpDownloader<R>
             .build();
 
         loop {
-            let _ = select! {
+            let _ = tokio::select! {
                 _stop = async { stop_token.await } => {
                     return;
                 },
@@ -461,17 +582,21 @@ impl<R> HttpDownloader<R>
         }
     }
 
-
     /// Given a http download request and a sink, split the download into multiple subdownloads and
     /// start
-    pub async fn spawn_downloads<S, C>(self: &Arc<Self>, download_request: HttpRequest, sink: Arc<Mutex<S>>, connector: C) -> Result<JoinHandle<()>, HttpDownloaderError>
-        where S: AsyncWriteExt + AsyncSeekExt + Send + Unpin + 'static,
-              C: Connect + Clone + Send + Sync + 'static
+    pub async fn spawn_downloads<S, C>(
+        self: &Arc<Self>,
+        download_request: HttpRequest,
+        sink: Arc<Mutex<S>>,
+        connector: C,
+    ) -> Result<JoinHandle<()>, HttpDownloaderError>
+    where
+        S: AsyncWriteExt + AsyncSeekExt + Send + Unpin + Debug + 'static,
+        C: Connect + Clone + Send + Sync + Debug + 'static,
     {
         // get the file size
         let size = {
-            let client = Client::builder()
-                .build::<_, Body>(connector.clone());
+            let client = Client::builder().build::<_, Body>(connector.clone());
 
             // the HTTP head method will return just the head of the HTTP response, we hope it will
             // return the Content-Length header to allow us to split the download into multiple
@@ -479,7 +604,8 @@ impl<R> HttpDownloader<R>
                 .body(Body::empty())
                 .unwrap();
 
-            client.request(request)
+            client
+                .request(request)
                 .await?
                 .headers()
                 .get("Content-Length")
@@ -495,88 +621,100 @@ impl<R> HttpDownloader<R>
         let file_path: Arc<Path> = Arc::from(download_request.path.clone());
 
         // convert the ranges to sub_downloads that we can store in the database
-        let downloads: Vec<SubDownload> =
-            ranges.into_iter().map(|range| {
-                SubDownload {
-                    id: -1,
-                    url: url.clone(),
-                    offset: range.0,
-                    total: range.1 - range.0,
-                    file_path: file_path.clone(),
-                }
-            }).map(|mut sub_download| {
+        let downloads: Vec<DownloadContext> = ranges
+            .into_iter()
+            .map(|range| DownloadContext {
+                id: -1,
+                url: url.clone(),
+                offset: range.0,
+                total: range.1 - range.0,
+                file_path: file_path.clone(),
+            })
+            .map(|mut sub_download| {
                 // todo: allow storing to fail, the challenge here is that `?` inside the map method
                 // doesn't work since the return type is not Option<T> or Result<T, E>
-                let id = self.
-                    download_store
-                    .add_download(&sub_download)
-                    .unwrap();
+                let id = self.download_store.add_download(&sub_download).unwrap();
 
                 sub_download.id = id;
                 sub_download
-            }).collect();
-
+            })
+            .collect();
 
         // download the file in parallel
         let mut download_tasks = vec![];
 
         for download in downloads {
-            download_tasks.push(tokio::spawn(Self::chunked_download(self.clone(), download, sink.clone(), connector.clone())));
+            download_tasks.push(tokio::spawn(Self::chunked_download(
+                self.clone(),
+                download,
+                sink.clone(),
+                connector.clone(),
+            )));
         }
 
-
-        Ok(tokio::spawn(async { join_all(download_tasks).await; }))
+        Ok(tokio::spawn(async move {
+            join_all(download_tasks).await;
+            event!(Level::INFO, "Download for {:?} is done!", download_request);
+        }))
     }
 
-
-    fn chunked_download<S, C>(self: Arc<Self>, mut download: SubDownload, sink: Arc<Mutex<S>>, connector: C) -> impl Future<Output=Result<(), HttpDownloaderError>>
-        where S: AsyncSeekExt + AsyncWriteExt + Send + Unpin + 'static,
-              C: Connect + Clone + Send + Sync + 'static
+    #[tracing::instrument]
+    fn chunked_download<S, C>(
+        self: Arc<Self>,
+        mut download: DownloadContext,
+        sink: Arc<Mutex<S>>,
+        connector: C,
+    ) -> impl Future<Output = Result<(), HttpDownloaderError>>
+    where
+        S: AsyncSeekExt + AsyncWriteExt + Send + Unpin + Debug + 'static,
+        C: Connect + Clone + Send + Sync + Debug + 'static,
     {
         let this = self.clone();
         async move {
             let request = Request::builder()
                 .method("GET")
                 .uri(download.url.as_str())
-                .header("Range", format!("bytes={}-{}", download.offset, download.offset + download.total - 1))
+                .header(
+                    "Range",
+                    dbg!(format!(
+                        "bytes={}-{}",
+                        download.offset,
+                        download.offset + download.total - 1
+                    )),
+                )
                 .body(Body::empty())
                 .unwrap();
 
+            let client = Client::builder().build::<_, Body>(connector.clone());
 
-            let client = Client::builder()
-                .build::<_, Body>(connector.clone());
-
-            let mut body = client.request(request)
-                .await?
-                .into_body();
-
+            let mut body = client.request(request).await?.into_body();
 
             // start downloading chunk by chunk
             while let Some(chunk) = body.data().await {
                 let chunk = chunk?;
                 {
-                    let mut guard = sink
-                        .lock()
-                        .await;
+                    //event!(Level::INFO, "chunk received len: {:?}, download offset: {:?}", chunk.len(), download.offset);
+
+                    let mut guard = sink.lock().await;
 
                     let sink = guard.deref_mut();
-
 
                     // make sure to seek to the correct position
                     sink.seek(SeekFrom::Start(download.offset as u64)).await?;
 
                     // then we can write
                     sink.write_all(&chunk).await?;
+
+                    // update the offset
+                    download.offset += chunk.len();
+
+                    let file_offset = sink.stream_position().await?;
+                    //event!(Level::INFO, "data written, download offset: {:?}, file offset: {:?}", download.offset, file_offset);
                 }
-                // update the offset
-                download.offset += chunk.len();
 
                 // update the database so query knows the most recent truth
-                this
-                    .download_store
-                    .update_download(&download)?
+                this.download_store.update_download(&download)?
             }
-
 
             // we're done our chunk, remove ourselves from the store
             self.download_store.remove_by_id(download.id)?;
@@ -586,19 +724,16 @@ impl<R> HttpDownloader<R>
     }
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::env::current_dir;
-    use std::thread::spawn;
-    use std::time::Duration;
     use super::*;
+    use crate::request::http::ChannelHttpRequestSource;
+    use std::env::current_dir;
+    use std::time::Duration;
     use tokio::sync::{mpsc, oneshot};
     use tokio::{join, time};
-    use crate::request::http::ChannelHttpRequestSource;
 
     embed_migrations!("migrations");
-
 
     fn init_db() -> color_eyre::Result<SqliteStore> {
         let store = SqliteStore::new(":memory:")?;
@@ -617,7 +752,7 @@ mod tests {
         let url = Arc::from(WgUrl::parse("https://www.google.com")?);
         let file_path: Arc<Path> = Arc::from(PathBuf::from("/tmp/test.txt"));
 
-        let download = SubDownload {
+        let download = DownloadContext {
             id: -90999,
             url: Arc::clone(&url),
             offset: 0,
@@ -627,7 +762,7 @@ mod tests {
 
         let res1 = store.add_download(&download)?;
 
-        let download = SubDownload {
+        let download = DownloadContext {
             // we do a bit of trolling
             id: -0,
             url: Arc::clone(&url),
@@ -652,7 +787,7 @@ mod tests {
         let url = Arc::from(WgUrl::parse("https://www.google.com")?);
         let file_path: Arc<Path> = Arc::from(PathBuf::from("/tmp/test.txt"));
 
-        let download = SubDownload {
+        let download = DownloadContext {
             id: -90999,
             url: Arc::clone(&url),
             offset: 0,
@@ -662,7 +797,7 @@ mod tests {
 
         store.add_download(&download)?;
 
-        let download = SubDownload {
+        let download = DownloadContext {
             // we do a bit of trolling
             id: -0,
             url: Arc::clone(&url),
@@ -685,7 +820,6 @@ mod tests {
             assert!(result.unwrap().is_empty());
         }
 
-
         {
             use crate::schema::file_path::dsl::*;
 
@@ -693,7 +827,6 @@ mod tests {
             assert!(result.is_ok());
             assert!(result.unwrap().is_empty());
         }
-
 
         Ok(())
     }
@@ -709,7 +842,7 @@ mod tests {
         let url = Arc::from(WgUrl::parse("https://www.google.com")?);
         let file_path: Arc<Path> = Arc::from(PathBuf::from("/tmp/test.txt"));
 
-        let mut download1 = SubDownload {
+        let mut download1 = DownloadContext {
             id: -90999,
             url: Arc::clone(&url),
             offset: 0,
@@ -719,8 +852,7 @@ mod tests {
 
         download1.id = store.add_download(&download1)?;
 
-
-        let mut download2 = SubDownload {
+        let mut download2 = DownloadContext {
             // we do a bit of trolling
             id: -0,
             url: Arc::clone(&url),
@@ -741,22 +873,30 @@ mod tests {
             assert_eq!(result[0].id, download2.id);
         }
 
-
         Ok(())
     }
 
     #[tokio::test]
     async fn download_ubuntu_22_04() -> color_eyre::Result<()> {
+        color_eyre::install()?;
+
+        tracing_subscriber::fmt().with_max_level(Level::INFO).init();
+
+        // let subscriber = tracing_subscriber::FmtSubscriber::new();
+        // tracing::subscriber::set_global_default(subscriber)?;
+
         let (req_tx, req_rx) = mpsc::channel(100);
         let request_source = ChannelHttpRequestSource::new(req_rx);
 
-        req_tx.send(HttpRequest {
-            url: WgUrl::parse("https://releases.ubuntu.com/22.04/ubuntu-22.04-desktop-amd64.iso")?,
-            path: current_dir().unwrap().join("ubuntu-22.04-desktop-amd64.iso"),
-        })
+        req_tx
+            .send(HttpRequest {
+                url: WgUrl::parse("http://127.0.0.1:8080/ubuntu-22.04-desktop-amd64.iso")?,
+                path: current_dir()
+                    .unwrap()
+                    .join("ubuntu-22.04-desktop-amd64.iso"),
+            })
             .await
             .unwrap();
-
 
         let store: SharedDownloadStore = Arc::new(init_db()?);
 
